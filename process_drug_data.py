@@ -115,7 +115,6 @@ def load_and_preprocess(filepath, fc_threshold=1.2):
 
     # Apply thresholding: |FC| <= 1.2 -> 0
     print(f"Applying threshold |FC| > {fc_threshold}...")
-    # Use map for newer pandas, applymap for older. map is safest for scalar application in modern pandas.
     try:
         df = df.map(lambda x: 0 if abs(x) <= fc_threshold else x)
     except AttributeError:
@@ -144,7 +143,6 @@ def apply_pca(data, sample_ids, output_dir, n_components=1000, gene_names=None):
 
     # Save PCA components (Rotation Matrix)
     # components_ is shape (n_components, n_features)
-    # We save it such that rows are components and columns are original genes
     if gene_names is not None:
         components_df = pd.DataFrame(pca.components_, columns=gene_names, index=[f"PC{i+1}" for i in range(n_components)])
         comp_file = os.path.join(output_dir, f"pca_components_{n_components}L.csv")
@@ -159,14 +157,30 @@ def apply_pca(data, sample_ids, output_dir, n_components=1000, gene_names=None):
 
     return pca_data, pca
 
-def train_and_encode(data, sample_ids, output_dir, latent_dim=10, epochs=50, batch_size=50):
+def train_and_encode_single_vae(data, sample_ids, output_dir, latent_dim, epochs=50, batch_size=50):
     """
-    Trains VAE and saves encoded representations.
+    Trains a single VAE with a specific latent dimension and saves its output.
     """
     original_dim = data.shape[1]
     print(f"Training VAE with input dim {original_dim} and latent dim {latent_dim}...")
 
-    vae = VAE(original_dim=original_dim, latent_dim=latent_dim)
+    # Adjust intermediate layers if latent_dim is large
+    # Heuristic from DeepProfile paper:
+    # if latent == 5: dim1=100, dim2=25
+    # if latent == 10: dim1=250, dim2=50
+    # if latent >= 25: dim1=250, dim2=100
+
+    if latent_dim == 5:
+        dim1 = 100
+        dim2 = 25
+    elif latent_dim == 10:
+        dim1 = 250
+        dim2 = 50
+    else:
+        dim1 = 250
+        dim2 = 100
+
+    vae = VAE(original_dim=original_dim, intermediate1_dim=dim1, intermediate2_dim=dim2, latent_dim=latent_dim)
     vae.compile(optimizer=keras.optimizers.Adam(learning_rate=0.0005))
 
     # Train
@@ -178,23 +192,23 @@ def train_and_encode(data, sample_ids, output_dir, latent_dim=10, epochs=50, bat
     print(f"VAE encoder weights saved to {weights_file}")
 
     # Encode
-    print("Encoding data...")
+    print(f"Encoding data with latent dim {latent_dim}...")
     z_mean, _, _ = vae.encoder.predict(data, batch_size=batch_size)
 
     # Save results
     output_file = os.path.join(output_dir, f"vae_encoded_{latent_dim}L.csv")
-    encoded_df = pd.DataFrame(z_mean, index=sample_ids, columns=[f"Latent_{i}" for i in range(latent_dim)])
+    encoded_df = pd.DataFrame(z_mean, index=sample_ids, columns=[f"Latent_{latent_dim}_{i}" for i in range(latent_dim)])
     encoded_df.to_csv(output_file)
     print(f"Encoded data saved to {output_file}")
 
     return encoded_df
 
 def main():
-    parser = argparse.ArgumentParser(description="Drug Response VAE Pipeline")
+    parser = argparse.ArgumentParser(description="DeepProfile VAE Pipeline")
     parser.add_argument("--input", required=True, help="Path to input CSV file")
     parser.add_argument("--output_dir", default="./output", help="Directory to save outputs")
     parser.add_argument("--pca_components", type=int, default=1000, help="Number of PCA components")
-    parser.add_argument("--latent_dim", type=int, default=10, help="Dimension of VAE latent space")
+    parser.add_argument("--latent_dims", type=str, default="5,10,25,50,75,100", help="Comma-separated list of latent dimensions to train VAEs for")
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
 
     args = parser.parse_args()
@@ -208,15 +222,19 @@ def main():
         return
 
     # 2. PCA
-    # We pass sample_ids, output_dir, and gene_names to save intermediate results
     data_pca, pca_model = apply_pca(df.values, df.index, args.output_dir,
                                     n_components=args.pca_components,
                                     gene_names=df.columns)
 
-    # 3. Train VAE and Encode
-    train_and_encode(data_pca, df.index, args.output_dir,
-                     latent_dim=args.latent_dim,
-                     epochs=args.epochs)
+    # 3. Train Ensemble of VAEs
+    latent_dims = [int(x) for x in args.latent_dims.split(',')]
+    print(f"Training VAE Ensemble for latent dimensions: {latent_dims}")
+
+    for latent_dim in latent_dims:
+        print(f"\n--- Training VAE (Latent Dim: {latent_dim}) ---")
+        train_and_encode_single_vae(data_pca, df.index, args.output_dir,
+                                    latent_dim=latent_dim,
+                                    epochs=args.epochs)
 
 if __name__ == "__main__":
     main()

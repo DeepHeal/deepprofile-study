@@ -8,9 +8,9 @@ import argparse
 import os
 import sys
 
-# Import VAE class definition from process_drug_data
-# We need to make sure process_drug_data is in the path or duplicated here.
-# For simplicity, I'll duplicate the VAE class definition to ensure standalone execution.
+# Import VAE class definition
+# To ensure standalone execution without cross-imports, we duplicate the VAE definition.
+# This must match the definition in process_drug_data.py exactly.
 from tensorflow.keras import layers, Model, metrics, backend as K
 from integrated_gradients_tf2 import IntegratedGradients
 
@@ -23,17 +23,30 @@ class VAE(keras.Model):
         self.latent_dim = latent_dim
         self.beta = beta
 
+        # Encoder
         self.encoder_inputs = keras.Input(shape=(original_dim,))
         x = layers.Dense(intermediate1_dim, kernel_initializer='glorot_uniform')(self.encoder_inputs)
         x = layers.BatchNormalization()(x)
         x = layers.Activation('relu')(x)
+
         x = layers.Dense(intermediate2_dim, kernel_initializer='glorot_uniform')(x)
         x = layers.BatchNormalization()(x)
         x = layers.Activation('relu')(x)
+
         self.z_mean = layers.Dense(latent_dim, name="z_mean")(x)
         self.z_log_var = layers.Dense(latent_dim, name="z_log_var")(x)
+
+        # Sampling
         self.z = layers.Lambda(self.sampling, output_shape=(latent_dim,), name='z')([self.z_mean, self.z_log_var])
+
         self.encoder = Model(self.encoder_inputs, [self.z_mean, self.z_log_var, self.z], name="encoder")
+
+        # Decoder
+        self.decoder_inputs = keras.Input(shape=(latent_dim,))
+        x = layers.Dense(intermediate2_dim, activation='relu', kernel_initializer='glorot_uniform')(self.decoder_inputs)
+        x = layers.Dense(intermediate1_dim, activation='relu', kernel_initializer='glorot_uniform')(x)
+        self.decoder_outputs = layers.Dense(original_dim, kernel_initializer='glorot_uniform')(x)
+        self.decoder = Model(self.decoder_inputs, self.decoder_outputs, name="decoder")
 
     def sampling(self, args):
         z_mean, z_log_var = args
@@ -41,15 +54,10 @@ class VAE(keras.Model):
         return z_mean + K.exp(z_log_var / 2) * epsilon
 
     def call(self, inputs):
-        # We only need the encoder part for analysis usually, but full model call is required for loading weights
-        # If we saved only weights, we need to rebuild the architecture exactly.
-        # This is a placeholder call.
         return self.encoder(inputs)
 
 def load_pathways(gmt_file):
-    """
-    Parses a GMT file into a dictionary of pathway_name -> gene_list.
-    """
+    """Parses a GMT file."""
     pathways = {}
     with open(gmt_file, 'r') as f:
         for line in f:
@@ -57,96 +65,50 @@ def load_pathways(gmt_file):
             if len(parts) < 3:
                 continue
             pathway_name = parts[0]
-            genes = parts[2:]  # Skip URL
+            genes = parts[2:]
             pathways[pathway_name] = genes
     return pathways
 
 def calculate_gene_importance(encoder, data, latent_dim):
-    """
-    Calculates gene importance using Integrated Gradients.
-    """
+    """Calculates IG for a single model."""
     ig = IntegratedGradients(encoder)
     n_samples, n_features = data.shape
-
-    # Store aggregated importance for each latent dimension: (n_features, latent_dim)
-    # We will average the absolute attribution over all samples.
-
-    # Initialize importance matrix
     feature_importance = np.zeros((n_features, latent_dim))
 
-    print("Calculating Integrated Gradients...")
-    # For efficiency, we might want to sample a subset of data if it's too large.
-    # Here we use all data as requested or a batch.
-
-    # Due to potential slowness, let's process sample by sample or in small batches.
-    # Current implementation of explain processes one sample.
-
+    print(f"Calculating Integrated Gradients (Dim {latent_dim})...")
     for k in range(latent_dim):
-        print(f"  Latent Dimension {k+1}/{latent_dim}")
         dim_importance = np.zeros(n_features)
-
+        # Using a subset of samples for speed if needed, but here using all
         for i in range(n_samples):
-            # Print progress every 10 samples
-            if i % 10 == 0:
-                sys.stdout.write(f"\r    Sample {i+1}/{n_samples}")
-                sys.stdout.flush()
-
             attr = ig.explain(data[i], target_idx=k, m_steps=50)
-            dim_importance += np.abs(attr) # Aggregate absolute importance
-
-        print("") # Newline
-        feature_importance[:, k] = dim_importance / n_samples # Average
-
+            dim_importance += np.abs(attr)
+        feature_importance[:, k] = dim_importance / n_samples
     return feature_importance
 
-def run_enrichment_tests(feature_importance, gene_names, pathways, top_g):
-    """
-    Runs Fisher's Exact Test for each pathway and latent dimension.
-
-    Args:
-        feature_importance: (n_features, latent_dim) matrix.
-        gene_names: List of gene names corresponding to rows.
-        pathways: Dictionary of pathway -> gene_list.
-        top_g: Number of top genes to select.
-
-    Returns:
-        DataFrame of adjusted p-values.
-    """
+def run_enrichment_tests(aggregated_importance, gene_names, pathways, top_g=None):
+    """Runs Fisher's Exact Test."""
     n_features = len(gene_names)
-    n_latent = feature_importance.shape[1]
+    n_clusters = aggregated_importance.shape[1]
 
-    # Filter pathways to only include genes present in our data
     valid_pathways = {}
     gene_set = set(gene_names)
-
     pathway_lengths = []
-
     for name, genes in pathways.items():
         valid_genes = [g for g in genes if g in gene_set]
         if len(valid_genes) > 0:
             valid_pathways[name] = valid_genes
             pathway_lengths.append(len(valid_genes))
 
-    avg_pathway_len = int(np.mean(pathway_lengths)) if pathway_lengths else top_g
-    print(f"Average pathway length in this dataset: {avg_pathway_len}")
-
-    # Use the calculated G if top_g was not explicitly forced (or pass it through)
-    # The requirement says "passed the top G genes... where G is the average pathway length".
-    if top_g is None:
-        G = avg_pathway_len
-    else:
-        G = top_g
-
-    print(f"Using G={G} for enrichment.")
+    avg_pathway_len = int(np.mean(pathway_lengths)) if pathway_lengths else (top_g if top_g else 10)
+    print(f"Average pathway length: {avg_pathway_len}")
+    G = top_g if top_g is not None else avg_pathway_len
+    print(f"Using top G={G} genes for enrichment.")
 
     results = []
 
-    for k in range(n_latent):
-        print(f"Running Enrichment for Latent Dimension {k+1}...")
-
-        # Get top G genes for this latent dim
-        importance_scores = feature_importance[:, k]
-        # Get indices of top G scores
+    for k in range(n_clusters):
+        # Process each Cluster (Meta-Feature)
+        importance_scores = aggregated_importance[:, k]
         top_indices = np.argsort(importance_scores)[::-1][:G]
         top_genes = set(gene_names[top_indices])
 
@@ -154,44 +116,25 @@ def run_enrichment_tests(feature_importance, gene_names, pathways, top_g):
         pathway_names_list = []
 
         for p_name, p_genes in valid_pathways.items():
-            # Fisher Exact Test Contingency Table
-            #              In Pathway    Not In Pathway
-            # Selected        A               B
-            # Not Selected    C               D
-
             p_genes_set = set(p_genes)
-
-            # A: Genes in pathway AND in top G
             A = len(top_genes.intersection(p_genes_set))
-
-            # B: Genes NOT in pathway BUT in top G
             B = len(top_genes) - A
-
-            # C: Genes in pathway BUT NOT in top G
             C = len(p_genes_set) - A
-
-            # D: Genes NOT in pathway AND NOT in top G
-            # Total genes = N
-            # Not Selected = N - G
-            # D = (N - G) - C
             D = (n_features - G) - C
 
             table = [[A, B], [C, D]]
             _, p_val = stats.fisher_exact(table, alternative='greater')
-
             p_values.append(p_val)
             pathway_names_list.append(p_name)
 
-        # FDR Correction
         if p_values:
             _, adj_p_values, _, _ = multipletests.multipletests(p_values, method='fdr_bh')
         else:
             adj_p_values = []
 
-        # Store results
         for i, p_name in enumerate(pathway_names_list):
             results.append({
-                'Latent_Dim': k,
+                'Cluster_ID': k,
                 'Pathway': p_name,
                 'P_Value': p_values[i],
                 'FDR': adj_p_values[i]
@@ -201,81 +144,125 @@ def run_enrichment_tests(feature_importance, gene_names, pathways, top_g):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", required=True, help="Path to preprocessed input data (CSV) used for training/encoding")
-    parser.add_argument("--vae_weights", required=True, help="Path to VAE encoder weights (.h5)")
-    parser.add_argument("--pca_components", help="Path to PCA components file (if PCA was used). If None, assumes raw input.")
-    parser.add_argument("--gmt", required=True, help="Path to GMT pathway file")
+    parser.add_argument("--data", required=True, help="Path to PCA-transformed data (CSV)")
+    parser.add_argument("--vae_weights_dir", required=True, help="Directory containing VAE weights")
+    parser.add_argument("--pca_components", required=True, help="Path to PCA components CSV")
+    parser.add_argument("--ensemble_labels", required=True, help="Path to Ensemble Labels CSV")
+    parser.add_argument("--gmt", required=True, help="Path to GMT file")
     parser.add_argument("--output_dir", default="pathway_results")
-    parser.add_argument("--latent_dim", type=int, default=10)
-    parser.add_argument("--original_dim", type=int, required=True, help="Input dimension to the VAE (if PCA is used, this is the number of PCA components)")
+    parser.add_argument("--latent_dims", default="5,10,25,50,75,100")
+    parser.add_argument("--original_dim", type=int, required=True, help="VAE input dimension (PCA components)")
 
     args = parser.parse_args()
 
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
-    # 1. Load Data
+    # 1. Load Data (PCA Transformed)
     print("Loading data...")
     df = pd.read_csv(args.data, index_col=0)
-    data = df.values.astype(np.float32) # (n_samples, n_features) if raw, or (n_samples, n_pca) if PCA applied
+    data = df.values.astype(np.float32)
 
-    # 2. Rebuild VAE Encoder
-    print(f"Building VAE with input dim {args.original_dim}...")
-    vae = VAE(original_dim=args.original_dim, latent_dim=args.latent_dim)
-    # Dummy call to build inputs
-    vae.encoder(tf.zeros((1, args.original_dim)))
-    print(f"Loading weights from {args.vae_weights}...")
-    vae.encoder.load_weights(args.vae_weights)
-
-    # 3. Calculate Importance
-    if args.pca_components:
-        print("Loading PCA components to project importance back to gene space...")
-        # Assuming PCA components file: rows=components, cols=genes (standard sklearn output saved as csv)
-        # We need to verify the format.
-        # If components are rows, we transpose.
-        # Let's assume the user provides (n_components, n_genes).
-        pca_df = pd.read_csv(args.pca_components, index_col=0)
-
-        # Check orientation: usually genes > components
-        if pca_df.shape[0] < pca_df.shape[1]:
-             # Rows are components, Cols are genes
-             pca_comps = pca_df.values # (n_components, n_genes)
-             gene_names = pca_df.columns
-             print(f"PCA shape detected: {pca_comps.shape} (Components x Genes)")
-        else:
-             # Rows are genes, Cols are components
-             pca_comps = pca_df.values.T # Transpose to get (n_components, n_genes)
-             gene_names = pca_df.index
-             print(f"PCA shape detected: {pca_comps.shape} (Genes x Components -> Transposed)")
-
-        # Calculate importance on VAE inputs (PCA space)
-        # data here should be the PCA-transformed data
-        print("Calculating importance in PCA space...")
-        pca_importance = calculate_gene_importance(vae.encoder, data, args.latent_dim) # (n_components, latent_dim)
-
-        # Project to Gene Space: (n_genes, latent_dim) = (n_genes, n_components) * (n_components, latent_dim)
-        # pca_comps.T is (n_genes, n_components)
-        print("Projecting importance to gene space...")
-        gene_importance = np.dot(pca_comps.T, pca_importance)
-
+    # 2. Load PCA Components (for projection)
+    print("Loading PCA components...")
+    pca_df = pd.read_csv(args.pca_components, index_col=0)
+    # Check orientation: If rows < cols, assume (Components, Genes)
+    if pca_df.shape[0] < pca_df.shape[1]:
+        pca_comps = pca_df.values
+        gene_names = pca_df.columns
     else:
-        # No PCA, direct mapping
-        gene_names = df.columns
-        gene_importance = calculate_gene_importance(vae.encoder, data, args.latent_dim)
+        pca_comps = pca_df.values.T
+        gene_names = pca_df.index
+    print(f"PCA Shape: {pca_comps.shape} (Components x Genes)")
 
-    # Take absolute values
-    gene_importance = np.abs(gene_importance)
+    # 3. Load Ensemble Labels
+    print("Loading Ensemble Labels...")
+    labels_df = pd.read_csv(args.ensemble_labels, index_col=0)
+    # Expected format: Index=Latent_Var_Name (e.g., Latent_5_0), Column="Cluster"
+    cluster_labels = labels_df["Cluster"].values
+    n_clusters = len(np.unique(cluster_labels))
+    print(f"Found {n_clusters} clusters.")
 
-    # 4. Pathway Analysis
+    # 4. Compute IG for ALL models and concatenate
+    latent_dims = [int(x) for x in args.latent_dims.split(',')]
+
+    # Initialize a list to store importance matrices for each model
+    # Each matrix will be (n_pca_components, latent_dim)
+    all_importances = []
+
+    for dim in latent_dims:
+        print(f"\nProcessing VAE (Latent Dim: {dim})")
+
+        # Build VAE
+        # Must recreate architecture based on dimension heuristic
+        if dim == 5: d1, d2 = 100, 25
+        elif dim == 10: d1, d2 = 250, 50
+        else: d1, d2 = 250, 100
+
+        vae = VAE(original_dim=args.original_dim, intermediate1_dim=d1, intermediate2_dim=d2, latent_dim=dim)
+        # Build
+        vae.encoder(tf.zeros((1, args.original_dim)))
+
+        # Load Weights
+        weights_path = os.path.join(args.vae_weights_dir, f"vae_encoder_weights_{dim}L.weights.h5")
+        if not os.path.exists(weights_path):
+            print(f"Warning: Weights not found at {weights_path}. Skipping.")
+            continue
+
+        print(f"Loading weights from {weights_path}...")
+        vae.encoder.load_weights(weights_path)
+
+        # Calculate IG (in PCA space)
+        # Result: (n_pca_components, dim)
+        imp = calculate_gene_importance(vae.encoder, data, dim)
+        all_importances.append(imp)
+
+    # Concatenate all importances along the latent dimension axis
+    # Shape: (n_pca_components, total_latent_vars)
+    concat_importance_pca = np.concatenate(all_importances, axis=1)
+    print(f"Total concatenated importance shape (PCA space): {concat_importance_pca.shape}")
+
+    # Verify alignment with labels
+    if concat_importance_pca.shape[1] != len(cluster_labels):
+        print(f"Error: Number of latent variables ({concat_importance_pca.shape[1]}) matches ensemble labels ({len(cluster_labels)})?")
+        # If mismatch, check if some models were skipped.
+        # Assuming alignment is correct based on processing order.
+
+    # 5. Project to Gene Space
+    # (n_genes, total_latent_vars) = (n_genes, n_components) * (n_components, total_latent_vars)
+    print("Projecting importance to gene space...")
+    concat_importance_gene = np.dot(pca_comps.T, concat_importance_pca)
+    print(f"Total importance shape (Gene space): {concat_importance_gene.shape}")
+
+    # 6. Aggregate by Cluster (Meta-Features)
+    # Sum importance of latent vars in same cluster
+    # Result: (n_genes, n_clusters)
+    print("Aggregating importance by cluster...")
+    aggregated_importance = np.zeros((concat_importance_gene.shape[0], n_clusters))
+
+    # The order of columns in concat_importance_gene corresponds to the order in labels_df?
+    # labels_df was created by concat(latent_dfs). latent_dfs loaded in order of dims.
+    # all_importances appended in order of dims.
+    # So order should match.
+
+    for k in range(n_clusters):
+        indices = np.where(cluster_labels == k)[0]
+        if len(indices) > 0:
+            # Sum or Mean?
+            # DeepProfile usually implies "Ensemble Gene Importance" is derived from the cluster.
+            # Summing accounts for the fact that multiple latent vars capturing the same signal reinforce it.
+            aggregated_importance[:, k] = np.sum(concat_importance_gene[:, indices], axis=1)
+
+    # 7. Pathway Enrichment
     print("Loading pathways...")
     pathways = load_pathways(args.gmt)
 
-    print("Running enrichment tests...")
-    results_df = run_enrichment_tests(gene_importance, gene_names, pathways, top_g=None)
+    print("Running enrichment tests on Ensemble Clusters...")
+    results_df = run_enrichment_tests(aggregated_importance, gene_names, pathways)
 
-    output_csv = os.path.join(args.output_dir, "enrichment_results.csv")
+    output_csv = os.path.join(args.output_dir, "ensemble_enrichment_results.csv")
     results_df.to_csv(output_csv, index=False)
-    print(f"Results saved to {output_csv}")
+    print(f"Ensemble enrichment results saved to {output_csv}")
 
 if __name__ == "__main__":
     main()
