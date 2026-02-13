@@ -1,7 +1,8 @@
 import pandas as pd
 import numpy as np
-import tensorflow as tf
-from tensorflow import keras
+import torch
+from torch import nn
+from torch.nn import functional as F
 import scipy.stats as stats
 import statsmodels.stats.multitest as multipletests
 import argparse
@@ -11,50 +12,50 @@ import sys
 # Import VAE class definition
 # To ensure standalone execution without cross-imports, we duplicate the VAE definition.
 # This must match the definition in process_drug_data.py exactly.
-from tensorflow.keras import layers, Model, metrics, backend as K
-from integrated_gradients_tf2 import IntegratedGradients
-
-class VAE(keras.Model):
-    def __init__(self, original_dim, intermediate1_dim=100, intermediate2_dim=25, latent_dim=5, beta=1.0, **kwargs):
-        super(VAE, self).__init__(**kwargs)
+class VAE(nn.Module):
+    def __init__(self, original_dim, intermediate1_dim=100, intermediate2_dim=25, latent_dim=5):
+        super(VAE, self).__init__()
         self.original_dim = original_dim
         self.intermediate1_dim = intermediate1_dim
         self.intermediate2_dim = intermediate2_dim
         self.latent_dim = latent_dim
-        self.beta = beta
 
         # Encoder
-        self.encoder_inputs = keras.Input(shape=(original_dim,))
-        x = layers.Dense(intermediate1_dim, kernel_initializer='glorot_uniform')(self.encoder_inputs)
-        x = layers.BatchNormalization()(x)
-        x = layers.Activation('relu')(x)
+        self.fc1 = nn.Linear(original_dim, intermediate1_dim)
+        self.bn1 = nn.BatchNorm1d(intermediate1_dim)
+        self.fc2 = nn.Linear(intermediate1_dim, intermediate2_dim)
+        self.bn2 = nn.BatchNorm1d(intermediate2_dim)
 
-        x = layers.Dense(intermediate2_dim, kernel_initializer='glorot_uniform')(x)
-        x = layers.BatchNormalization()(x)
-        x = layers.Activation('relu')(x)
-
-        self.z_mean = layers.Dense(latent_dim, name="z_mean")(x)
-        self.z_log_var = layers.Dense(latent_dim, name="z_log_var")(x)
-
-        # Sampling
-        self.z = layers.Lambda(self.sampling, output_shape=(latent_dim,), name='z')([self.z_mean, self.z_log_var])
-
-        self.encoder = Model(self.encoder_inputs, [self.z_mean, self.z_log_var, self.z], name="encoder")
+        self.fc_mean = nn.Linear(intermediate2_dim, latent_dim)
+        self.fc_log_var = nn.Linear(intermediate2_dim, latent_dim)
 
         # Decoder
-        self.decoder_inputs = keras.Input(shape=(latent_dim,))
-        x = layers.Dense(intermediate2_dim, activation='relu', kernel_initializer='glorot_uniform')(self.decoder_inputs)
-        x = layers.Dense(intermediate1_dim, activation='relu', kernel_initializer='glorot_uniform')(x)
-        self.decoder_outputs = layers.Dense(original_dim, kernel_initializer='glorot_uniform')(x)
-        self.decoder = Model(self.decoder_inputs, self.decoder_outputs, name="decoder")
+        self.fc3 = nn.Linear(latent_dim, intermediate2_dim)
+        self.fc4 = nn.Linear(intermediate2_dim, intermediate1_dim)
+        self.fc5 = nn.Linear(intermediate1_dim, original_dim)
 
-    def sampling(self, args):
-        z_mean, z_log_var = args
-        epsilon = K.random_normal(shape=K.shape(z_mean), mean=0., stddev=1.0)
-        return z_mean + K.exp(z_log_var / 2) * epsilon
+    def encode(self, x):
+        h1 = F.relu(self.bn1(self.fc1(x)))
+        h2 = F.relu(self.bn2(self.fc2(h1)))
+        return self.fc_mean(h2), self.fc_log_var(h2)
 
-    def call(self, inputs):
-        return self.encoder(inputs)
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z):
+        h3 = F.relu(self.fc3(z))
+        h4 = F.relu(self.fc4(h3))
+        return self.fc5(h4)
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z), mu, logvar
+
+# Import PyTorch IG
+from integrated_gradients_pytorch import IntegratedGradients
 
 def load_pathways(gmt_file):
     """Parses a GMT file."""
@@ -69,20 +70,37 @@ def load_pathways(gmt_file):
             pathways[pathway_name] = genes
     return pathways
 
-def calculate_gene_importance(encoder, data, latent_dim):
-    """Calculates IG for a single model."""
-    ig = IntegratedGradients(encoder)
+def calculate_gene_importance(model, data, latent_dim, device):
+    """Calculates IG for a single model (PyTorch)."""
+    ig = IntegratedGradients(model)
     n_samples, n_features = data.shape
     feature_importance = np.zeros((n_features, latent_dim))
 
+    # Convert data to tensor once if it fits in memory, or loop
+    # IG.explain handles conversion but doing it here might be cleaner for batching?
+    # IG.explain takes a single sample. We loop over samples.
+
     print(f"Calculating Integrated Gradients (Dim {latent_dim})...")
+
+    # Wrap model to return only the mu part, as IG expects direct output
+    # But our IG implementation handles tuple return in compute_gradients.
+
     for k in range(latent_dim):
         dim_importance = np.zeros(n_features)
-        # Using a subset of samples for speed if needed, but here using all
+
         for i in range(n_samples):
-            attr = ig.explain(data[i], target_idx=k, m_steps=50)
+            # Print progress every 100 samples
+            if i % 100 == 0:
+                 sys.stdout.write(f"\r  Latent {k+1}/{latent_dim} - Sample {i+1}/{n_samples}")
+                 sys.stdout.flush()
+
+            input_sample = data[i] # numpy array
+            attr = ig.explain(input_sample, target_idx=k, m_steps=50)
             dim_importance += np.abs(attr)
+
+        print("") # Newline
         feature_importance[:, k] = dim_importance / n_samples
+
     return feature_importance
 
 def run_enrichment_tests(aggregated_importance, gene_names, pathways, top_g=None):
@@ -158,6 +176,10 @@ def main():
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
+    # Setup Device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
     # 1. Load Data (PCA Transformed)
     print("Loading data...")
     df = pd.read_csv(args.data, index_col=0)
@@ -178,79 +200,55 @@ def main():
     # 3. Load Ensemble Labels
     print("Loading Ensemble Labels...")
     labels_df = pd.read_csv(args.ensemble_labels, index_col=0)
-    # Expected format: Index=Latent_Var_Name (e.g., Latent_5_0), Column="Cluster"
     cluster_labels = labels_df["Cluster"].values
     n_clusters = len(np.unique(cluster_labels))
     print(f"Found {n_clusters} clusters.")
 
     # 4. Compute IG for ALL models and concatenate
     latent_dims = [int(x) for x in args.latent_dims.split(',')]
-
-    # Initialize a list to store importance matrices for each model
-    # Each matrix will be (n_pca_components, latent_dim)
     all_importances = []
 
     for dim in latent_dims:
         print(f"\nProcessing VAE (Latent Dim: {dim})")
 
         # Build VAE
-        # Must recreate architecture based on dimension heuristic
         if dim == 5: d1, d2 = 100, 25
         elif dim == 10: d1, d2 = 250, 50
         else: d1, d2 = 250, 100
 
         vae = VAE(original_dim=args.original_dim, intermediate1_dim=d1, intermediate2_dim=d2, latent_dim=dim)
-        # Build
-        vae.encoder(tf.zeros((1, args.original_dim)))
+        vae.to(device)
 
         # Load Weights
-        weights_path = os.path.join(args.vae_weights_dir, f"vae_encoder_weights_{dim}L.weights.h5")
+        weights_path = os.path.join(args.vae_weights_dir, f"vae_encoder_weights_{dim}L.pth")
         if not os.path.exists(weights_path):
             print(f"Warning: Weights not found at {weights_path}. Skipping.")
             continue
 
         print(f"Loading weights from {weights_path}...")
-        vae.encoder.load_weights(weights_path)
+        vae.load_state_dict(torch.load(weights_path, map_location=device))
+        vae.eval()
 
         # Calculate IG (in PCA space)
-        # Result: (n_pca_components, dim)
-        imp = calculate_gene_importance(vae.encoder, data, dim)
+        imp = calculate_gene_importance(vae, data, dim, device)
         all_importances.append(imp)
 
-    # Concatenate all importances along the latent dimension axis
-    # Shape: (n_pca_components, total_latent_vars)
+    # Concatenate all importances
     concat_importance_pca = np.concatenate(all_importances, axis=1)
     print(f"Total concatenated importance shape (PCA space): {concat_importance_pca.shape}")
 
-    # Verify alignment with labels
-    if concat_importance_pca.shape[1] != len(cluster_labels):
-        print(f"Error: Number of latent variables ({concat_importance_pca.shape[1]}) matches ensemble labels ({len(cluster_labels)})?")
-        # If mismatch, check if some models were skipped.
-        # Assuming alignment is correct based on processing order.
-
     # 5. Project to Gene Space
-    # (n_genes, total_latent_vars) = (n_genes, n_components) * (n_components, total_latent_vars)
     print("Projecting importance to gene space...")
     concat_importance_gene = np.dot(pca_comps.T, concat_importance_pca)
     print(f"Total importance shape (Gene space): {concat_importance_gene.shape}")
 
-    # 6. Aggregate by Cluster (Meta-Features)
-    # Sum importance of latent vars in same cluster
-    # Result: (n_genes, n_clusters)
+    # 6. Aggregate by Cluster
     print("Aggregating importance by cluster...")
     aggregated_importance = np.zeros((concat_importance_gene.shape[0], n_clusters))
-
-    # The order of columns in concat_importance_gene corresponds to the order in labels_df?
-    # labels_df was created by concat(latent_dfs). latent_dfs loaded in order of dims.
-    # all_importances appended in order of dims.
-    # So order should match.
 
     for k in range(n_clusters):
         indices = np.where(cluster_labels == k)[0]
         if len(indices) > 0:
-            # Sum or Mean?
-            # DeepProfile usually implies "Ensemble Gene Importance" is derived from the cluster.
-            # Summing accounts for the fact that multiple latent vars capturing the same signal reinforce it.
             aggregated_importance[:, k] = np.sum(concat_importance_gene[:, indices], axis=1)
 
     # 7. Pathway Enrichment

@@ -1,101 +1,75 @@
 import pandas as pd
 import numpy as np
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers, Model, metrics, optimizers, backend as K
+import torch
+from torch import nn, optim
+from torch.nn import functional as F
+from torch.utils.data import DataLoader, TensorDataset
 from sklearn.decomposition import PCA
 import argparse
 import os
 
-# --- VAE Model Definition ---
-class VAE(keras.Model):
-    def __init__(self, original_dim, intermediate1_dim=100, intermediate2_dim=25, latent_dim=5, beta=1.0, **kwargs):
-        super(VAE, self).__init__(**kwargs)
+# --- VAE Model Definition (PyTorch) ---
+class VAE(nn.Module):
+    def __init__(self, original_dim, intermediate1_dim=100, intermediate2_dim=25, latent_dim=5):
+        super(VAE, self).__init__()
         self.original_dim = original_dim
         self.intermediate1_dim = intermediate1_dim
         self.intermediate2_dim = intermediate2_dim
         self.latent_dim = latent_dim
-        self.beta = beta
 
         # Encoder
-        self.encoder_inputs = keras.Input(shape=(original_dim,))
-        x = layers.Dense(intermediate1_dim, kernel_initializer='glorot_uniform')(self.encoder_inputs)
-        x = layers.BatchNormalization()(x)
-        x = layers.Activation('relu')(x)
+        self.fc1 = nn.Linear(original_dim, intermediate1_dim)
+        self.bn1 = nn.BatchNorm1d(intermediate1_dim)
+        self.fc2 = nn.Linear(intermediate1_dim, intermediate2_dim)
+        self.bn2 = nn.BatchNorm1d(intermediate2_dim)
 
-        x = layers.Dense(intermediate2_dim, kernel_initializer='glorot_uniform')(x)
-        x = layers.BatchNormalization()(x)
-        x = layers.Activation('relu')(x)
-
-        self.z_mean = layers.Dense(latent_dim, name="z_mean")(x)
-        self.z_log_var = layers.Dense(latent_dim, name="z_log_var")(x)
-
-        # Sampling layer
-        self.z = layers.Lambda(self.sampling, output_shape=(latent_dim,), name='z')([self.z_mean, self.z_log_var])
-
-        # Define encoder model for later use
-        self.encoder = Model(self.encoder_inputs, [self.z_mean, self.z_log_var, self.z], name="encoder")
+        self.fc_mean = nn.Linear(intermediate2_dim, latent_dim)
+        self.fc_log_var = nn.Linear(intermediate2_dim, latent_dim)
 
         # Decoder
-        self.decoder_inputs = keras.Input(shape=(latent_dim,))
-        x = layers.Dense(intermediate2_dim, activation='relu', kernel_initializer='glorot_uniform')(self.decoder_inputs)
-        x = layers.Dense(intermediate1_dim, activation='relu', kernel_initializer='glorot_uniform')(x)
-        self.decoder_outputs = layers.Dense(original_dim, kernel_initializer='glorot_uniform')(x)
+        self.fc3 = nn.Linear(latent_dim, intermediate2_dim)
+        # Assuming original Keras impl used Relu activation in decoder layers
+        self.fc4 = nn.Linear(intermediate2_dim, intermediate1_dim)
+        self.fc5 = nn.Linear(intermediate1_dim, original_dim)
 
-        # Define decoder model for later use
-        self.decoder = Model(self.decoder_inputs, self.decoder_outputs, name="decoder")
+        # Initialize weights (Glorot Uniform is PyTorch default for Linear, but let's be explicit if needed)
+        # PyTorch default init is Kaiming Uniform for Relu, Glorot Uniform (Xavier) for Linear usually works too.
+        # We'll stick to defaults for simplicity unless performance degrades.
 
-        self.total_loss_tracker = metrics.Mean(name="total_loss")
-        self.reconstruction_loss_tracker = metrics.Mean(name="reconstruction_loss")
-        self.kl_loss_tracker = metrics.Mean(name="kl_loss")
+    def encode(self, x):
+        h1 = F.relu(self.bn1(self.fc1(x)))
+        h2 = F.relu(self.bn2(self.fc2(h1)))
+        return self.fc_mean(h2), self.fc_log_var(h2)
 
-    def sampling(self, args):
-        z_mean, z_log_var = args
-        epsilon = K.random_normal(shape=K.shape(z_mean), mean=0., stddev=1.0)
-        return z_mean + K.exp(z_log_var / 2) * epsilon
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
 
-    @property
-    def metrics(self):
-        return [
-            self.total_loss_tracker,
-            self.reconstruction_loss_tracker,
-            self.kl_loss_tracker,
-        ]
+    def decode(self, z):
+        h3 = F.relu(self.fc3(z))
+        h4 = F.relu(self.fc4(h3))
+        return self.fc5(h4) # No activation at output (Linear), assuming input was standard scaled or raw
 
-    def train_step(self, data):
-        if isinstance(data, tuple):
-            data = data[0]
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z), mu, logvar
 
-        with tf.GradientTape() as tape:
-            z_mean, z_log_var, z = self.encoder(data)
-            reconstruction = self.decoder(z)
+# Loss Function
+def loss_function(recon_x, x, mu, logvar, beta=1.0):
+    # Reconstruction loss (MSE)
+    # Keras implementation used: reduce_mean(reduce_sum(square(diff), axis=1))
+    # PyTorch MSELoss(reduction='sum') sums over batch AND features.
+    # We want sum over features, mean over batch.
+    recon_loss = F.mse_loss(recon_x, x, reduction='none').sum(axis=1).mean()
 
-            reconstruction_loss = tf.reduce_mean(
-                tf.reduce_sum(tf.square(data - reconstruction), axis=1)
-            )
+    # KL Divergence
+    # -0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
+    # Keras: -0.5 * mean(sum(... , axis=1))
+    kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
 
-            kl_loss = -0.5 * (1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
-            kl_loss = tf.reduce_mean(tf.reduce_sum(kl_loss, axis=1))
-
-            total_loss = reconstruction_loss + self.beta * kl_loss
-
-        grads = tape.gradient(total_loss, self.trainable_variables)
-        self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
-
-        self.total_loss_tracker.update_state(total_loss)
-        self.reconstruction_loss_tracker.update_state(reconstruction_loss)
-        self.kl_loss_tracker.update_state(kl_loss)
-
-        return {
-            "loss": self.total_loss_tracker.result(),
-            "reconstruction_loss": self.reconstruction_loss_tracker.result(),
-            "kl_loss": self.kl_loss_tracker.result(),
-        }
-
-    def call(self, inputs):
-        z_mean, z_log_var, z = self.encoder(inputs)
-        reconstruction = self.decoder(z)
-        return reconstruction
+    return recon_loss + beta * kl_loss
 
 def load_and_preprocess(filepath, fc_threshold=1.2):
     """
@@ -142,7 +116,6 @@ def apply_pca(data, sample_ids, output_dir, n_components=1000, gene_names=None):
     print(f"PCA shape: {pca_data.shape}")
 
     # Save PCA components (Rotation Matrix)
-    # components_ is shape (n_components, n_features)
     if gene_names is not None:
         components_df = pd.DataFrame(pca.components_, columns=gene_names, index=[f"PC{i+1}" for i in range(n_components)])
         comp_file = os.path.join(output_dir, f"pca_components_{n_components}L.csv")
@@ -159,41 +132,68 @@ def apply_pca(data, sample_ids, output_dir, n_components=1000, gene_names=None):
 
 def train_and_encode_single_vae(data, sample_ids, output_dir, latent_dim, epochs=50, batch_size=50):
     """
-    Trains a single VAE with a specific latent dimension and saves its output.
+    Trains a single VAE (PyTorch) with a specific latent dimension and saves its output.
     """
     original_dim = data.shape[1]
     print(f"Training VAE with input dim {original_dim} and latent dim {latent_dim}...")
 
-    # Adjust intermediate layers if latent_dim is large
-    # Heuristic from DeepProfile paper:
-    # if latent == 5: dim1=100, dim2=25
-    # if latent == 10: dim1=250, dim2=50
-    # if latent >= 25: dim1=250, dim2=100
-
+    # Heuristic for intermediate dimensions
     if latent_dim == 5:
-        dim1 = 100
-        dim2 = 25
+        dim1, dim2 = 100, 25
     elif latent_dim == 10:
-        dim1 = 250
-        dim2 = 50
+        dim1, dim2 = 250, 50
     else:
-        dim1 = 250
-        dim2 = 100
+        dim1, dim2 = 250, 100
 
-    vae = VAE(original_dim=original_dim, intermediate1_dim=dim1, intermediate2_dim=dim2, latent_dim=latent_dim)
-    vae.compile(optimizer=keras.optimizers.Adam(learning_rate=0.0005))
+    # Setup Device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-    # Train
-    vae.fit(data, epochs=epochs, batch_size=batch_size, verbose=2)
+    # Initialize Model
+    vae = VAE(original_dim=original_dim, intermediate1_dim=dim1, intermediate2_dim=dim2, latent_dim=latent_dim).to(device)
+    optimizer = optim.Adam(vae.parameters(), lr=0.0005)
 
-    # Save Encoder Weights
-    weights_file = os.path.join(output_dir, f"vae_encoder_weights_{latent_dim}L.weights.h5")
-    vae.encoder.save_weights(weights_file)
-    print(f"VAE encoder weights saved to {weights_file}")
+    # Data Loader
+    tensor_x = torch.Tensor(data) # transform to torch tensor
+    my_dataset = TensorDataset(tensor_x) # create your datset
+    dataloader = DataLoader(my_dataset, batch_size=batch_size, shuffle=True)
 
-    # Encode
+    # Training Loop
+    vae.train()
+    for epoch in range(epochs):
+        train_loss = 0
+        for batch_idx, (data_batch,) in enumerate(dataloader):
+            data_batch = data_batch.to(device)
+            optimizer.zero_grad()
+            recon_batch, mu, logvar = vae(data_batch)
+            loss = loss_function(recon_batch, data_batch, mu, logvar)
+            loss.backward()
+            train_loss += loss.item()
+            optimizer.step()
+
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(f'Epoch: {epoch+1} Average loss: {train_loss / len(dataloader.dataset):.4f}')
+
+    # Save Model State Dict
+    weights_file = os.path.join(output_dir, f"vae_encoder_weights_{latent_dim}L.pth")
+    torch.save(vae.state_dict(), weights_file)
+    print(f"VAE weights saved to {weights_file}")
+
+    # Encode Data
     print(f"Encoding data with latent dim {latent_dim}...")
-    z_mean, _, _ = vae.encoder.predict(data, batch_size=batch_size)
+    vae.eval()
+    encoded_data = []
+
+    # Use a non-shuffled dataloader for encoding to keep order
+    encode_loader = DataLoader(TensorDataset(tensor_x), batch_size=batch_size, shuffle=False)
+
+    with torch.no_grad():
+        for (data_batch,) in encode_loader:
+            data_batch = data_batch.to(device)
+            mu, _ = vae.encode(data_batch)
+            encoded_data.append(mu.cpu().numpy())
+
+    z_mean = np.concatenate(encoded_data, axis=0)
 
     # Save results
     output_file = os.path.join(output_dir, f"vae_encoded_{latent_dim}L.csv")
@@ -204,7 +204,7 @@ def train_and_encode_single_vae(data, sample_ids, output_dir, latent_dim, epochs
     return encoded_df
 
 def main():
-    parser = argparse.ArgumentParser(description="DeepProfile VAE Pipeline")
+    parser = argparse.ArgumentParser(description="DeepProfile VAE Pipeline (PyTorch)")
     parser.add_argument("--input", required=True, help="Path to input CSV file")
     parser.add_argument("--output_dir", default="./output", help="Directory to save outputs")
     parser.add_argument("--pca_components", type=int, default=1000, help="Number of PCA components")
@@ -228,7 +228,7 @@ def main():
 
     # 3. Train Ensemble of VAEs
     latent_dims = [int(x) for x in args.latent_dims.split(',')]
-    print(f"Training VAE Ensemble for latent dimensions: {latent_dims}")
+    print(f"Training VAE Ensemble (PyTorch) for latent dimensions: {latent_dims}")
 
     for latent_dim in latent_dims:
         print(f"\n--- Training VAE (Latent Dim: {latent_dim}) ---")
