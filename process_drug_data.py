@@ -123,9 +123,9 @@ def load_and_preprocess(filepath, fc_threshold=1.2):
 
     return df
 
-def apply_pca(data, n_components=1000):
+def apply_pca(data, sample_ids, output_dir, n_components=1000, gene_names=None):
     """
-    Applies PCA to reduce dimensionality.
+    Applies PCA to reduce dimensionality and saves components and transformed data.
     """
     print(f"Applying PCA to reduce dimensions to {n_components}...")
     n_samples, n_features = data.shape
@@ -141,6 +141,22 @@ def apply_pca(data, n_components=1000):
     pca = PCA(n_components=n_components)
     pca_data = pca.fit_transform(data)
     print(f"PCA shape: {pca_data.shape}")
+
+    # Save PCA components (Rotation Matrix)
+    # components_ is shape (n_components, n_features)
+    # We save it such that rows are components and columns are original genes
+    if gene_names is not None:
+        components_df = pd.DataFrame(pca.components_, columns=gene_names, index=[f"PC{i+1}" for i in range(n_components)])
+        comp_file = os.path.join(output_dir, f"pca_components_{n_components}L.csv")
+        components_df.to_csv(comp_file)
+        print(f"PCA components saved to {comp_file}")
+
+    # Save transformed data (Input for VAE)
+    transformed_df = pd.DataFrame(pca_data, index=sample_ids, columns=[f"PC{i+1}" for i in range(n_components)])
+    trans_file = os.path.join(output_dir, f"pca_transformed_{n_components}L.csv")
+    transformed_df.to_csv(trans_file)
+    print(f"PCA transformed data saved to {trans_file}")
+
     return pca_data, pca
 
 def train_and_encode(data, sample_ids, output_dir, latent_dim=10, epochs=50, batch_size=50):
@@ -155,6 +171,11 @@ def train_and_encode(data, sample_ids, output_dir, latent_dim=10, epochs=50, bat
 
     # Train
     vae.fit(data, epochs=epochs, batch_size=batch_size, verbose=2)
+
+    # Save Encoder Weights
+    weights_file = os.path.join(output_dir, f"vae_encoder_weights_{latent_dim}L.weights.h5")
+    vae.encoder.save_weights(weights_file)
+    print(f"VAE encoder weights saved to {weights_file}")
 
     # Encode
     print("Encoding data...")
@@ -187,7 +208,10 @@ def main():
         return
 
     # 2. PCA
-    data_pca, pca_model = apply_pca(df.values, n_components=args.pca_components)
+    # We pass sample_ids, output_dir, and gene_names to save intermediate results
+    data_pca, pca_model = apply_pca(df.values, df.index, args.output_dir,
+                                    n_components=args.pca_components,
+                                    gene_names=df.columns)
 
     # 3. Train VAE and Encode
     train_and_encode(data_pca, df.index, args.output_dir,
